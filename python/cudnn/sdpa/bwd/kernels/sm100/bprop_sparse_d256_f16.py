@@ -1,7 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen Sparse Attention (QSA) backward for SM100, written with the CuTe DSL primitives."""
+"""Qwen Sparse Attention (QSA) backward for SM100, written with the CuTe DSL primitives.
+
+A template specialized by ``FROST_TEMPLATE_PARAMS`` (``sparse_gqa_sm100.QsaBwdParams``, injected by
+``cudnn.frost.template_loader.load_template``): GQA ratio GQ in {12, 16} and PAIRS, the number of KV-head pairs of the
+model; the selection is always 512 blocks (topk_idxs [T, 2051]). One launch sequence covers 2 KV heads (HQ = 2 * GQ
+query heads); a model with more KV heads runs one sequence per KV-head pair, each on that pair's head-slice view of the
+caller's tensors (Q/O/dO/dQ/LSE rows are HQ_ROW = PAIRS * HQ heads apart, K/V/dK/dV rows HKV_ROW = PAIRS * HKV).
+Imported directly, the module is the 24 Q / 2 KV head, single-pair kernel.
+
+Geometry-dependent pieces: Q/dO boxes, score/dQ MMA N and dS^T core-matrix strides scale with HQ; CHB is the largest
+chunk that keeps the 24-head shared-memory footprint; the dense pair kernel keeps its N = 48 tile as DP_G = 48 // GQ
+queries of GQ heads, with the softmax warps mapping their 24 columns to (query, head) at compile time.
+"""
 
 import math
 
@@ -11,8 +23,9 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
 from cuda.bindings import driver as cuda_driver
-from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 from cutlass.experimental import primitives as prims
+
 
 from cudnn.api_base import ws_align
 
@@ -20,33 +33,44 @@ I32 = cutlass.Int32
 F32 = cutlass.Float32
 BF16 = cutlass.BFloat16
 
-HQ = 24
-HKV = 2
-GQ = 12
-D = 256
-W = 2051
+_PARAMS = globals().get("FROST_TEMPLATE_PARAMS")
+GQ = getattr(_PARAMS, "gq", 12)
 TOPK = 512
+assert GQ in (12, 16), "the dense pair kernel tiles N = 48 columns as whole queries and the sparse kernel needs 2 * GQ <= 32"
+HKV = 2
+HQ = HKV * GQ
+D = 256
+# Caller tensors may be head-pair views of a model with PAIRS * HKV KV heads: Q/O/dO/dQ/LSE rows are HQ_ROW heads
+# apart and K/V/dK/dV rows HKV_ROW heads apart. Internal scratch (delta, accumulators) stays compact.
+PAIRS = getattr(_PARAMS, "pairs", 1)
+HQ_ROW = HQ * PAIRS
+HKV_ROW = HKV * PAIRS
+W = 2051
 SCALE = 1.0 / 16.0
 LOG2E = 1.4426950408889634
 
 NTHREADS = 512
 # Blocks per chunk fill 8 * CHB of the 128 MMA rows, and 13 is the largest count whose two K stages and one V stage
 # fit in shared memory. Rows past 8 * CHB alias the next region, which for V includes fp32 staging that may decode as NaN.
-CHB = 13
+QSLAB = HQ * 128  # one 64-dim SW128 slab of the HQ Q (or dO) rows
+DS_LBO = (HQ // 8) * 128  # dS^T core-matrix row group: HQ / 8 column groups of 8 rows x 16 B
+DS_BYTES = 16 * DS_LBO
+BLK_SMEM = 4096
+NDRAIN = 8
+EP_BYTES = 4096
+# The original 24-head layout used 223232 B with CHB = 13; keep that footprint as the budget.
+_SMEM_BUDGET = 223232
+CHB = max(c for c in range(1, 17) if 8 * QSLAB + 3 * c * BLK_SMEM + DS_BYTES + NDRAIN * EP_BYTES <= _SMEM_BUDGET)
 
 
 OFF_Q = 0  # [4 slabs][24 head rows x 128 B] with a 128-byte swizzle (SW128), rows 0-11 for KV head 0
-OFF_DO = 12288
-QSLAB = 3072
-OFF_K = 24576  # MMA row = 8 * block + 2 * token + head, so one block covers both KV heads
-BLK_SMEM = 4096  # a gathered block is exactly [4 slabs][8 rows x 128 B] of SW128 atoms, so its TMA box needs no repack
+OFF_DO = 4 * QSLAB
+OFF_K = 8 * QSLAB  # MMA row = 8 * block + 2 * token + head, so one block covers both KV heads
+# BLK_SMEM: a gathered block is exactly [4 slabs][8 rows x 128 B] of SW128 atoms, so its TMA box needs no repack
 SLAB = 1024
 K_STAGE = CHB * BLK_SMEM  # blocks sit at the 8-row-group stride of the MMA operand
 OFF_V = OFF_K + 2 * K_STAGE
 OFF_DS = OFF_V + K_STAGE
-DS_BYTES = 6144
-NDRAIN = 8
-EP_BYTES = 4096
 OFF_EP = OFF_DS + DS_BYTES
 SMEM_BYTES = OFF_EP + NDRAIN * EP_BYTES
 
@@ -61,7 +85,7 @@ L2_EVICT_FIRST = 0x12F0000000000000  # createpolicy encodings of the L2 evict-fi
 L2_EVICT_LAST = 0x14F0000000000000
 TM_COLS = 512
 
-Q_BOX_BYTES = 24 * 128
+Q_BOX_BYTES = HQ * 128
 
 
 @cute.jit
@@ -313,7 +337,7 @@ def qsa_bwd_sparse_kernel(
                 c_dtype=F32,
                 a_dtype=BF16,
                 b_dtype=BF16,
-                n_dim=24,
+                n_dim=HQ,
                 m_dim=128,
                 a_major=0,
                 b_major=0,
@@ -331,7 +355,7 @@ def qsa_bwd_sparse_kernel(
                 c_dtype=F32,
                 a_dtype=BF16,
                 b_dtype=BF16,
-                n_dim=24,
+                n_dim=HQ,
                 m_dim=128,
                 a_major=1,
                 b_major=1,
@@ -349,7 +373,7 @@ def qsa_bwd_sparse_kernel(
             d_q_mn = _desc(sbase + OFF_Q // 4, QSLAB, 1024, SW128)
             d_do_mn = _desc(sbase + OFF_DO // 4, QSLAB, 1024, SW128)
             # dS^T as B of dQ^T (MN-major, no swizzle): leading byte offset = next 8 K-rows, stride byte offset = next 8 columns
-            d_ds_mn = _desc(sbase + OFF_DS // 4, 384, 128, SWN)
+            d_ds_mn = _desc(sbase + OFF_DS // 4, DS_LBO, 128, SWN)
 
             gc = I32(0)
             nq = I32(0)
@@ -413,7 +437,7 @@ def qsa_bwd_sparse_kernel(
                                                     prims.CTAGroup.CTA_1,
                                                     prims.make_tmem_ptr(tmem_raw + (TM_DQ + hh * 32), F32),
                                                     dk_mn.advance_start_address(hh * 2 * SLAB + kk * 2 * BLK_SMEM),
-                                                    d_ds_mn.advance_start_address(kk * 768),
+                                                    d_ds_mn.advance_start_address(kk * 2 * DS_LBO),
                                                     idesc_q,
                                                     acc_q | (kk > 0),
                                                 )
@@ -462,7 +486,7 @@ def qsa_bwd_sparse_kernel(
             c_s = F32(SCALE * LOG2E)
             gc = I32(0)
             nq = I32(0)
-            ds_off = (OFF_DS + jrow * 384 + (row & 7) * 16) // 4
+            ds_off = (OFF_DS + jrow * DS_LBO + (row & 7) * 16) // 4
             for pp in cutlass.range(NP, unroll=1):
                 for qq in cutlass.range(qlo + bid, T, nctas, unroll=1):
                     qi = qq
@@ -473,13 +497,10 @@ def qsa_bwd_sparse_kernel(
                         lrow = p_sparse_blocks + ((qi - qlo) * PART_W + o0)
                         ncb, nsel, ntail, _nb = _qmeta(qi)
                         nchunks = (nblk + (CHB - 1)) // CHB
-                        lbase = qi * HQ + hrow * GQ
-                        lse_a = (p_lse + lbase).load(count=4, alignment=16)
-                        lse_b = (p_lse + lbase + 4).load(count=4, alignment=16)
-                        lse_c = (p_lse + lbase + 8).load(count=4, alignment=16)
-                        del_a = (p_delta + lbase).load(count=4, alignment=16)
-                        del_b = (p_delta + lbase + 4).load(count=4, alignment=16)
-                        del_c = (p_delta + lbase + 8).load(count=4, alignment=16)
+                        lbase = qi * HQ_ROW + hrow * GQ
+                        dbase = qi * HQ + hrow * GQ  # delta is compact scratch; lse follows the caller's row stride
+                        lse_v = [(p_lse + lbase + 4 * i).load(count=4, alignment=16) for i in range(GQ // 4)]
+                        del_v = [(p_delta + dbase + 4 * i).load(count=4, alignment=16) for i in range(GQ // 4)]
                         for c in cutlass.range(nchunks, unroll=1):
                             cgc = gc + c
                             st = cgc & 1
@@ -502,15 +523,8 @@ def qsa_bwd_sparse_kernel(
                             pw = []
                             dw = []
                             for j in cutlass.range_constexpr(GQ):
-                                if cutlass.const_expr(j < 4):
-                                    lj = lse_a[j]
-                                    ej = del_a[j]
-                                elif cutlass.const_expr(j < 8):
-                                    lj = lse_b[j - 4]
-                                    ej = del_b[j - 4]
-                                else:
-                                    lj = lse_c[j - 8]
-                                    ej = del_c[j - 8]
+                                lj = lse_v[j // 4][j % 4]
+                                ej = del_v[j // 4][j % 4]
                                 s0 = sv[j]
                                 d0 = dpv[j]
                                 if hrow == 1:
@@ -555,7 +569,7 @@ def qsa_bwd_sparse_kernel(
                             prims.tcgen05_st("32x32b", t_pt, pvec)
                             prims.tcgen05_st("32x32b", t_dst, dvec)
                             # dQ^T reads dS^T as an SMEM B operand, so the row is also stored as MN-major core matrices.
-                            for nc in cutlass.range_constexpr(3):
+                            for nc in cutlass.range_constexpr(HQ // 8):
                                 (sbase + ds_off + nc * 32).store(dvec[nc * 4 : nc * 4 + 4], alignment=16)
                             prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
                             prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -740,9 +754,9 @@ def _sparse_host(
     stream: cuda_driver.CUstream,
 ):
     T = q.shape[0]
-    tma_q = cuda.create_tensor_map_tiled_from_view(q, box_dims=(1, 24, 64), stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
-    tma_do = cuda.create_tensor_map_tiled_from_view(do, box_dims=(1, 24, 64), stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
-    kv_layout = cute.make_layout((T, HKV, 4, 64), stride=(HKV * D, D, 64, 1))
+    tma_q = cuda.create_tensor_map_tiled_from_view(q, box_dims=(1, HQ, 64), stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
+    tma_do = cuda.create_tensor_map_tiled_from_view(do, box_dims=(1, HQ, 64), stride_order=(2, 1, 0), swizzle=cuda.TensorMapSwizzle.s128b)
+    kv_layout = cute.make_layout((T, HKV, 4, 64), stride=(HKV_ROW * D, D, 64, 1))
     tma_k = cuda.create_tensor_map_tiled_from_view(
         cute.make_tensor(k.iterator, kv_layout),
         box_dims=(4, HKV, 4, 64),
@@ -785,7 +799,7 @@ def qsa_bwd_prep_kernel(
     T: I32,
     nz: I32,
     nsel: I32,
-    n_dq_acc: I32,
+    n_dq_acc8: I32,
     n_dense_dkv: I32,
 ):
     tidx, _, _ = cute.arch.thread_idx()
@@ -798,8 +812,10 @@ def qsa_bwd_prep_kernel(
     p_delta = g_delta.iterator.raw_ptr()
     nrows = T * HQ
     for r in cutlass.range(bid * (PREP_THREADS // 32) + wib, nrows, nb * (PREP_THREADS // 32), unroll=1):
-        ov = (p_o + r * D + lane * 8).load(count=8, alignment=16).to(F32)
-        dv = (p_do + r * D + lane * 8).load(count=8, alignment=16).to(F32)
+        rt = r // HQ
+        ro = (cutlass.Int64(rt) * HQ_ROW + (r - rt * HQ)) * D + lane * 8
+        ov = (p_o + ro).load(count=8, alignment=16).to(F32)
+        dv = (p_do + ro).load(count=8, alignment=16).to(F32)
         acc = F32(0.0)
         for j in cutlass.range_constexpr(8):
             acc = acc + ov[j] * dv[j]
@@ -818,7 +834,7 @@ def qsa_bwd_prep_kernel(
     for it in cutlass.range(bid * PREP_THREADS + tidx, nsel // 4, nb * PREP_THREADS, unroll=1):
         (p_dense_block_bitmap + it * 4).store(zi, alignment=16)
     p_dq_acc = g_dq_acc.iterator.raw_ptr()
-    for it in cutlass.range(bid * PREP_THREADS + tidx, n_dq_acc // 8, nb * PREP_THREADS, unroll=1):
+    for it in cutlass.range(bid * PREP_THREADS + tidx, n_dq_acc8, nb * PREP_THREADS, unroll=1):
         (p_dq_acc + it * 8).store(zf, alignment=16)
     p_dense_dk_acc = g_dense_dk_acc.iterator.raw_ptr()
     p_dense_dv_acc = g_dense_dv_acc.iterator.raw_ptr()
@@ -859,7 +875,7 @@ def _prep_host(
         I32(T),
         I32(nz),
         I32(dense_block_bitmap.shape[0]),
-        I32(dq_acc.shape[0]),
+        I32(T) * I32(HQ * D // 8),  # T * HQ * D can be exactly 2**31, which an Int32 extent cannot carry
         I32(dense_dk_acc.shape[0]),
     ).launch(grid=(nblocks, 1, 1), block=(PREP_THREADS, 1, 1), stream=stream)
 
@@ -999,13 +1015,16 @@ def qsa_bwd_finalize_kernel(
         if j < num_dense_queries:
             ak = ak + (p_dense_dk_acc + eo).load(count=8, alignment=16)
             av = av + (p_dense_dv_acc + eo).load(count=8, alignment=16)
-        (p_dk + eo).store(ak.to(BF16), alignment=16)
-        (p_dv + eo).store(av.to(BF16), alignment=16)
+        oo = j * (HKV_ROW * D) + (it & 63) * 8
+        (p_dk + oo).store(ak.to(BF16), alignment=16)
+        (p_dv + oo).store(av.to(BF16), alignment=16)
     nq8 = num_dense_queries * (HQ * D // 8)
     if cutlass.const_expr(HAS_SPARSE > 0):
         nq8 = T * (HQ * D // 8)
     for it in cutlass.range(bid * FIN_THREADS + tidx, nq8, nb * FIN_THREADS, unroll=1):
-        (p_dq + it * 8).store((p_dq_acc + it * 8).load(count=8, alignment=16).to(F32).to(BF16), alignment=16)
+        qt = it // (HQ * D // 8)
+        qo = cutlass.Int64(qt) * (HQ_ROW * D) + (it - qt * (HQ * D // 8)) * 8
+        (p_dq + qo).store((p_dq_acc + it * 8).load(count=8, alignment=16).to(F32).to(BF16), alignment=16)
 
 
 qsa_bwd_finalize_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1043,8 +1062,14 @@ def _rot(k, off, nk):
 # Key-tile-major path for the queries below num_dense_queries. The two CTAs of a cluster split each group's work by operand, so every
 # MMA keeps M=128 and each CTA holds one [128 x 256] fp32 dV or dK accumulator in TMEM across all groups.
 DP_TT = 128
-DP_G = 4
-DP_N = DP_G * GQ
+DP_N = 48
+DP_G = DP_N // GQ
+# Softmax half hf owns score columns [24 hf, 24 hf + 24); column n is query n // GQ, head n % GQ of the group.
+DP_HALF_QUERIES = [sorted({n // GQ for n in range(24 * h, 24 * h + 24)}) for h in range(2)]
+DP_HALF_VECS = [[sorted({(n % GQ) // 4 for n in range(24 * h, 24 * h + 24) if n // GQ == q}) for q in DP_HALF_QUERIES[h]] for h in range(2)]
+DP_HALF_SLOT = [[DP_HALF_QUERIES[h].index(n // GQ) for n in range(24 * h, 24 * h + 24)] for h in range(2)]
+DP_HALF_VEC = [[DP_HALF_VECS[h][DP_HALF_SLOT[h][n - 24 * h]].index((n % GQ) // 4) for n in range(24 * h, 24 * h + 24)] for h in range(2)]
+DP_HALF_LANE = [[(n % GQ) % 4 for n in range(24 * h, 24 * h + 24)] for h in range(2)]
 DP_THREADS = 512
 DP_KSLAB = DP_TT * 128
 DP_QSLAB = DP_N * 128
@@ -1359,7 +1384,7 @@ def qsa_bwd_dense_pair_kernel(
             asrc = p_k
             if rank == 1:
                 asrc = p_v
-            vrow = asrc + (tok * HKV + hk) * D
+            vrow = asrc + (tok * HKV_ROW + hk) * D
             for c2 in cutlass.range_constexpr(2):
                 c4 = hf * 2 + c2
                 stw = []
@@ -1380,199 +1405,175 @@ def qsa_bwd_dense_pair_kernel(
             if prims.elect_sync():
                 prims.mbarrier_arrive(b_vt)
             scol = tmem_col0 + DP_TM_SD + hf * 24
-            if rank == 0:
-                # Selection words and lse load one group ahead to hide their latency.
-                g_n = g_top - 1 - _rot(I32(0), off, nk)
-                sw_n = []
-                av_n = []
-                for jj in cutlass.range_constexpr(2):
-                    qc = g_n * DP_G + hf * 2 + jj
-                    if qc >= num_dense_queries:
-                        qc = num_dense_queries - 1
-                    sw_n.append((p_dense_block_bitmap + (qc * NW + wsel)).load())
-                    ab = qc * HQ + hk * GQ
-                    av_n.append(
-                        [
-                            (p_lse + ab).load(count=4, alignment=16),
-                            (p_lse + ab + 4).load(count=4, alignment=16),
-                            (p_lse + ab + 8).load(count=4, alignment=16),
-                        ]
-                    )
-                for k in cutlass.range(nk, unroll=1):
-                    g = g_top - 1 - _rot(k, off, nk)
-                    sw = sw_n
-                    av = av_n
-                    kn = k + 1
-                    if kn >= nk:
-                        kn = nk - 1
-                    g_n = g_top - 1 - _rot(kn, off, nk)
-                    sw_n = []
-                    av_n = []
-                    for jj in cutlass.range_constexpr(2):
-                        qc = g_n * DP_G + hf * 2 + jj
-                        if qc >= num_dense_queries:
-                            qc = num_dense_queries - 1
-                        sw_n.append((p_dense_block_bitmap + (qc * NW + wsel)).load())
-                        ab = qc * HQ + hk * GQ
-                        av_n.append(
-                            [
-                                (p_lse + ab).load(count=4, alignment=16),
-                                (p_lse + ab + 4).load(count=4, alignment=16),
-                                (p_lse + ab + 8).load(count=4, alignment=16),
-                            ]
-                        )
-                    _wait(b_sf, k & 1)
-                    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                    xv0 = prims.tcgen05_ld("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, scol).as_ptr(F32), num=16)
-                    xv1 = prims.tcgen05_ld("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, scol + 16).as_ptr(F32), num=8)
-                    prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-                    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                    prims.bar_warp_sync(0xFFFFFFFF)
-                    if prims.elect_sync():
-                        prims.mbarrier_arrive(b_sr)
-                    opk = []
-                    for jj in cutlass.range_constexpr(2):
-                        qi = g * DP_G + hf * 2 + jj
-                        ncb = (qi + 1) >> 2
-                        sel = (sw[jj] >> bsel) & 1
-                        valid = row_ok & (qi < num_dense_queries) & (tok <= qi) & ((sel != 0) | (blk == ncb))
-                        ow = []
-                        for hh in cutlass.range_constexpr(GQ):
-                            n = jj * GQ + hh
-                            a = av[jj][hh // 4][hh % 4]
-                            if cutlass.const_expr(n < 16):
-                                x = xv0[n]
-                            else:
-                                x = xv1[n - 16]
-                            e = cute.math.exp2(x * c_s - a * F32(LOG2E), fastmath=True)
-                            pj = F32(0.0)
-                            if valid:
-                                pj = e
-                            ow.append(pj)
-                        pk = cutlass.Vector.from_elements(ow, F32).to(BF16).bitcast(I32)
-                        for u in cutlass.range_constexpr(GQ // 2):
-                            opk.append(pk[u])
-                    ovec = cutlass.Vector.from_elements(opk, I32)
-                    xb = k % DP_NX
-                    if k >= 1:
-                        # dV(k-1) has read the TMEM P^T slot
-                        kp = k - 1
-                        _wait(b_pe.subview(kp % DP_NX), (kp // DP_NX) & 1)
-                    if k >= DP_NX:
-                        # dQ^T(k - DP_NX) has completed: rank 1 has read P(k - DP_NX) (dS(k - DP_NX) arrived) and may receive into its
-                        # buffer again, and our dS buffer is free for dS(k)
-                        _wait(b_xe.subview(xb), ((k // DP_NX) & 1) ^ 1)
-                    if hf == 0:
-                        prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[0]).as_ptr(I32), ovec[0:8])
-                        prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[1]).as_ptr(I32), ovec[8:12])
-                    else:
-                        prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[1] + 4).as_ptr(I32), ovec[0:4])
-                        prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[2]).as_ptr(I32), ovec[4:12])
-                    rb = prims.mapa(b_xr.subview(xb), peer)
-                    for nc in cutlass.range_constexpr(3):
-                        _st_async16(prims.mapa(sbase + xoff + xb * (DP_CM // 4) + nc * 32, peer), ovec[nc * 4 : nc * 4 + 4], rb)
-                    prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-                    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                    prims.bar_warp_sync(0xFFFFFFFF)
-                    if prims.elect_sync():
-                        prims.mbarrier_arrive(b_pf.subview(xb))
-            else:
-                g_n = g_top - 1 - _rot(I32(0), off, nk)
-                av_n = []
-                for jj in cutlass.range_constexpr(2):
-                    qc = g_n * DP_G + hf * 2 + jj
-                    if qc >= num_dense_queries:
-                        qc = num_dense_queries - 1
-                    ab = qc * HQ + hk * GQ
-                    av_n.append(
-                        [
-                            (p_delta + ab).load(count=4, alignment=16),
-                            (p_delta + ab + 4).load(count=4, alignment=16),
-                            (p_delta + ab + 8).load(count=4, alignment=16),
-                        ]
-                    )
-                for k in cutlass.range(nk, unroll=1):
-                    av = av_n
-                    kn = k + 1
-                    if kn >= nk:
-                        kn = nk - 1
-                    g_n = g_top - 1 - _rot(kn, off, nk)
-                    av_n = []
-                    for jj in cutlass.range_constexpr(2):
-                        qc = g_n * DP_G + hf * 2 + jj
-                        if qc >= num_dense_queries:
-                            qc = num_dense_queries - 1
-                        ab = qc * HQ + hk * GQ
-                        av_n.append(
-                            [
-                                (p_delta + ab).load(count=4, alignment=16),
-                                (p_delta + ab + 4).load(count=4, alignment=16),
-                                (p_delta + ab + 8).load(count=4, alignment=16),
-                            ]
-                        )
-                    _wait(b_sf, k & 1)
-                    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                    xv0 = prims.tcgen05_ld("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, scol).as_ptr(F32), num=16)
-                    xv1 = prims.tcgen05_ld("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, scol + 16).as_ptr(F32), num=8)
-                    prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-                    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                    prims.bar_warp_sync(0xFFFFFFFF)
-                    if prims.elect_sync():
-                        prims.mbarrier_arrive(b_sr)
-                    xb = k % DP_NX
-                    _wait(b_xr.subview(xb), (k // DP_NX) & 1)
-                    pin = []
-                    for nc in cutlass.range_constexpr(3):
-                        pin.append((sbase + xoff + xb * (DP_CM // 4) + nc * 32).load(count=4, alignment=16))
-                    prims.bar_warp_sync(0xFFFFFFFF)
-                    if k + DP_NX < nk:
-                        if warp == 4:
+            # Each half hf owns score columns [24 * hf, 24 * hf + 24) of the DP_N = 48; column n is query n // GQ, head n % GQ
+            # of the group. The half is specialised at compile time so lse / delta / bitmap loads stay 16-byte vectors.
+            for hfc in cutlass.range_constexpr(2):
+                qs = DP_HALF_QUERIES[hfc]
+                vecs = DP_HALF_VECS[hfc]
+                if hf == hfc:
+                    if rank == 0:
+                        # Selection words and lse load one group ahead to hide their latency.
+                        g_n = g_top - 1 - _rot(I32(0), off, nk)
+                        sw_n = []
+                        av_n = []
+                        for si in cutlass.range_constexpr(len(qs)):
+                            qc = g_n * DP_G + qs[si]
+                            if qc >= num_dense_queries:
+                                qc = num_dense_queries - 1
+                            sw_n.append((p_dense_block_bitmap + (qc * NW + wsel)).load())
+                            ab = qc * HQ_ROW + hk * GQ
+                            av_n.append([(p_lse + ab + 4 * vv).load(count=4, alignment=16) for vv in vecs[si]])
+                        for k in cutlass.range(nk, unroll=1):
+                            g = g_top - 1 - _rot(k, off, nk)
+                            sw = sw_n
+                            av = av_n
+                            kn = k + 1
+                            if kn >= nk:
+                                kn = nk - 1
+                            g_n = g_top - 1 - _rot(kn, off, nk)
+                            sw_n = []
+                            av_n = []
+                            for si in cutlass.range_constexpr(len(qs)):
+                                qc = g_n * DP_G + qs[si]
+                                if qc >= num_dense_queries:
+                                    qc = num_dense_queries - 1
+                                sw_n.append((p_dense_block_bitmap + (qc * NW + wsel)).load())
+                                ab = qc * HQ_ROW + hk * GQ
+                                av_n.append([(p_lse + ab + 4 * vv).load(count=4, alignment=16) for vv in vecs[si]])
+                            _wait(b_sf, k & 1)
+                            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                            xv0 = prims.tcgen05_ld("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, scol).as_ptr(F32), num=16)
+                            xv1 = prims.tcgen05_ld("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, scol + 16).as_ptr(F32), num=8)
+                            prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+                            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                            prims.bar_warp_sync(0xFFFFFFFF)
                             if prims.elect_sync():
-                                # arm this buffer for P(k + DP_NX): rank 0 sends it only after dS(k) (whose quadrant-0
-                                # copy this warp issues after this arm) has been consumed by its dQ^T
-                                prims.mbarrier_arrive_expect_tx(b_xr.subview(xb), DP_CM)
-                    dpk = []
-                    for jj in cutlass.range_constexpr(2):
-                        dw = []
-                        for hh in cutlass.range_constexpr(GQ):
-                            n = jj * GQ + hh
-                            a = av[jj][hh // 4][hh % 4]
-                            if cutlass.const_expr(n < 16):
-                                x = xv0[n]
+                                prims.mbarrier_arrive(b_sr)
+                            vq = []
+                            for si in cutlass.range_constexpr(len(qs)):
+                                qi = g * DP_G + qs[si]
+                                ncb = (qi + 1) >> 2
+                                sel = (sw[si] >> bsel) & 1
+                                vq.append(row_ok & (qi < num_dense_queries) & (tok <= qi) & ((sel != 0) | (blk == ncb)))
+                            ow = []
+                            for c in cutlass.range_constexpr(24):
+                                si = DP_HALF_SLOT[hfc][c]
+                                a = av[si][DP_HALF_VEC[hfc][c]][DP_HALF_LANE[hfc][c]]
+                                if cutlass.const_expr(c < 16):
+                                    x = xv0[c]
+                                else:
+                                    x = xv1[c - 16]
+                                e = cute.math.exp2(x * c_s - a * F32(LOG2E), fastmath=True)
+                                pj = F32(0.0)
+                                if vq[si]:
+                                    pj = e
+                                ow.append(pj)
+                            ovec = cutlass.Vector.from_elements(ow, F32).to(BF16).bitcast(I32)
+                            xb = k % DP_NX
+                            if k >= 1:
+                                # dV(k-1) has read the TMEM P^T slot
+                                kp = k - 1
+                                _wait(b_pe.subview(kp % DP_NX), (kp // DP_NX) & 1)
+                            if k >= DP_NX:
+                                # dQ^T(k - DP_NX) has completed: rank 1 has read P(k - DP_NX) (dS(k - DP_NX) arrived) and may receive into its
+                                # buffer again, and our dS buffer is free for dS(k)
+                                _wait(b_xe.subview(xb), ((k // DP_NX) & 1) ^ 1)
+                            if cutlass.const_expr(hfc == 0):
+                                prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[0]).as_ptr(I32), ovec[0:8])
+                                prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[1]).as_ptr(I32), ovec[8:12])
                             else:
-                                x = xv1[n - 16]
-                            dw.append(x - a)
-                        for hp in cutlass.range_constexpr(GQ // 2):
-                            n0 = jj * GQ + 2 * hp
-                            pw = pin[n0 // 8][(n0 % 8) // 2]
-                            pv = cutlass.Vector.from_elements([pw], I32).bitcast(BF16).to(F32)
-                            dpk.append(
-                                cutlass.Vector.from_elements([pv[0] * dw[2 * hp] * F32(SCALE), pv[1] * dw[2 * hp + 1] * F32(SCALE)], F32)
-                                .to(BF16)
-                                .bitcast(I32)[0]
-                            )
-                    dvec = cutlass.Vector.from_elements(dpk, I32)
-                    if k >= 1:
-                        # dK / dQ^T(k-1) have read the TMEM dS^T slot (and k - DP_NX this SMEM buffer). The copy of dS(k - DP_NX)
-                        # has landed and rank 0's dQ^T(k - DP_NX) has consumed it (both implied by the arrival of P(k)).
-                        kp = k - 1
-                        _wait(b_pe.subview(kp % DP_NX), (kp // DP_NX) & 1)
-                    if hf == 0:
-                        prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[0]).as_ptr(I32), dvec[0:8])
-                        prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[1]).as_ptr(I32), dvec[8:12])
+                                prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[1] + 4).as_ptr(I32), ovec[0:4])
+                                prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[2]).as_ptr(I32), ovec[4:12])
+                            rb = prims.mapa(b_xr.subview(xb), peer)
+                            for nc in cutlass.range_constexpr(3):
+                                _st_async16(prims.mapa(sbase + xoff + xb * (DP_CM // 4) + nc * 32, peer), ovec[nc * 4 : nc * 4 + 4], rb)
+                            prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
+                            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                            prims.bar_warp_sync(0xFFFFFFFF)
+                            if prims.elect_sync():
+                                prims.mbarrier_arrive(b_pf.subview(xb))
                     else:
-                        prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[1] + 4).as_ptr(I32), dvec[0:4])
-                        prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[2]).as_ptr(I32), dvec[4:12])
-                    rb = prims.mapa(b_xr.subview(xb), peer)
-                    for nc in cutlass.range_constexpr(3):
-                        (sbase + xoffd + xb * (DP_CM // 4) + nc * 32).store(dvec[nc * 4 : nc * 4 + 4], alignment=16)
-                        _st_async16(prims.mapa(sbase + xoffd + xb * (DP_CM // 4) + nc * 32, peer), dvec[nc * 4 : nc * 4 + 4], rb)
-                    prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
-                    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-                    prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
-                    prims.bar_warp_sync(0xFFFFFFFF)
-                    if prims.elect_sync():
-                        prims.mbarrier_arrive(b_pf.subview(xb))
+                        g_n = g_top - 1 - _rot(I32(0), off, nk)
+                        av_n = []
+                        for si in cutlass.range_constexpr(len(qs)):
+                            qc = g_n * DP_G + qs[si]
+                            if qc >= num_dense_queries:
+                                qc = num_dense_queries - 1
+                            ab = qc * HQ + hk * GQ
+                            av_n.append([(p_delta + ab + 4 * vv).load(count=4, alignment=16) for vv in vecs[si]])
+                        for k in cutlass.range(nk, unroll=1):
+                            av = av_n
+                            kn = k + 1
+                            if kn >= nk:
+                                kn = nk - 1
+                            g_n = g_top - 1 - _rot(kn, off, nk)
+                            av_n = []
+                            for si in cutlass.range_constexpr(len(qs)):
+                                qc = g_n * DP_G + qs[si]
+                                if qc >= num_dense_queries:
+                                    qc = num_dense_queries - 1
+                                ab = qc * HQ + hk * GQ
+                                av_n.append([(p_delta + ab + 4 * vv).load(count=4, alignment=16) for vv in vecs[si]])
+                            _wait(b_sf, k & 1)
+                            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                            xv0 = prims.tcgen05_ld("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, scol).as_ptr(F32), num=16)
+                            xv1 = prims.tcgen05_ld("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, scol + 16).as_ptr(F32), num=8)
+                            prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+                            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                            prims.bar_warp_sync(0xFFFFFFFF)
+                            if prims.elect_sync():
+                                prims.mbarrier_arrive(b_sr)
+                            xb = k % DP_NX
+                            _wait(b_xr.subview(xb), (k // DP_NX) & 1)
+                            pin = []
+                            for nc in cutlass.range_constexpr(3):
+                                pin.append((sbase + xoff + xb * (DP_CM // 4) + nc * 32).load(count=4, alignment=16))
+                            prims.bar_warp_sync(0xFFFFFFFF)
+                            if k + DP_NX < nk:
+                                if warp == 4:
+                                    if prims.elect_sync():
+                                        # arm this buffer for P(k + DP_NX): rank 0 sends it only after dS(k) (whose quadrant-0
+                                        # copy this warp issues after this arm) has been consumed by its dQ^T
+                                        prims.mbarrier_arrive_expect_tx(b_xr.subview(xb), DP_CM)
+                            dw = []
+                            for c in cutlass.range_constexpr(24):
+                                si = DP_HALF_SLOT[hfc][c]
+                                a = av[si][DP_HALF_VEC[hfc][c]][DP_HALF_LANE[hfc][c]]
+                                if cutlass.const_expr(c < 16):
+                                    x = xv0[c]
+                                else:
+                                    x = xv1[c - 16]
+                                dw.append(x - a)
+                            dpk = []
+                            for hp in cutlass.range_constexpr(12):
+                                c0 = 2 * hp
+                                pw = pin[c0 // 8][(c0 % 8) // 2]
+                                pv = cutlass.Vector.from_elements([pw], I32).bitcast(BF16).to(F32)
+                                dpk.append(
+                                    cutlass.Vector.from_elements([pv[0] * dw[c0] * F32(SCALE), pv[1] * dw[c0 + 1] * F32(SCALE)], F32).to(BF16).bitcast(I32)[0]
+                                )
+                            dvec = cutlass.Vector.from_elements(dpk, I32)
+                            if k >= 1:
+                                # dK / dQ^T(k-1) have read the TMEM dS^T slot (and k - DP_NX this SMEM buffer). The copy of dS(k - DP_NX)
+                                # has landed and rank 0's dQ^T(k - DP_NX) has consumed it (both implied by the arrival of P(k)).
+                                kp = k - 1
+                                _wait(b_pe.subview(kp % DP_NX), (kp // DP_NX) & 1)
+                            if cutlass.const_expr(hfc == 0):
+                                prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[0]).as_ptr(I32), dvec[0:8])
+                                prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[1]).as_ptr(I32), dvec[8:12])
+                            else:
+                                prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[1] + 4).as_ptr(I32), dvec[0:4])
+                                prims.tcgen05_st("32x32b", prims.TmemAddr.from_row_col(tmem_row0 + qd * 32, tmem_col0 + DP_TM_PA[2]).as_ptr(I32), dvec[4:12])
+                            rb = prims.mapa(b_xr.subview(xb), peer)
+                            for nc in cutlass.range_constexpr(3):
+                                (sbase + xoffd + xb * (DP_CM // 4) + nc * 32).store(dvec[nc * 4 : nc * 4 + 4], alignment=16)
+                                _st_async16(prims.mapa(sbase + xoffd + xb * (DP_CM // 4) + nc * 32, peer), dvec[nc * 4 : nc * 4 + 4], rb)
+                            prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
+                            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                            prims.fence_proxy(prims.Proxy.ASYNC_SHARED, space=prims.SharedSpace.shared_cta)
+                            prims.bar_warp_sync(0xFFFFFFFF)
+                            if prims.elect_sync():
+                                prims.mbarrier_arrive(b_pf.subview(xb))
             _wait(b_kvd, 0)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             obase = (tok * HKV + hk) * D + hf * 128
@@ -1713,10 +1714,11 @@ SPARSE_COST_RATIO = 12
 MAX_DENSE_QUERIES = SPARSE_COST_RATIO * TOPK * 4
 KV_PASS = 16384  # sparse kernel KV pass (tokens): one pass's K/V + fp32 dK/dV (~96 MB) stays L2 resident
 KV_PASS_MIN_T = 16384  # up to this T the whole sequence already fits one L2-resident pass
-DP_U = 320  # tuned query groups per dense work unit, small enough to backfill the sparse grid's tail evenly
-DP_U_ALL = (384, 448)  # without a sparse grid to backfill, larger units (for Gd < 4096 / >= 4096) amortize each key tile load
-# The kernels address [T, 24, 256] tensors with 32-bit element offsets.
-MAX_SEQ_LEN = (2**31 - 1) // (HQ * D)
+# Tuned for 4-query groups (GQ = 12); scaled so a work unit keeps the same number of queries for other DP_G.
+DP_U = 320 * 4 // DP_G  # query groups per dense work unit, small enough to backfill the sparse grid's tail evenly
+DP_U_ALL = (384 * 4 // DP_G, 448 * 4 // DP_G)  # without a sparse grid to backfill, larger units amortize each key tile load
+# The kernels address [T, HQ, 256] tensors with 32-bit element offsets.
+MAX_SEQ_LEN = 2**31 // (HQ * D)  # the largest element offset T * HQ * D - 1 still fits Int32
 
 
 class LaunchPlan:
@@ -1731,7 +1733,8 @@ class LaunchPlan:
         self.nw = (self.num_dense_queries + 127) // 128
         self.nsel = ((self.num_dense_queries + 2) * self.nw + 64 + 3) // 4 * 4
         gd = (self.num_dense_queries + DP_G - 1) // DP_G
-        self.dense_unit = DP_U if self.has_sparse else (DP_U_ALL[1] if gd >= 4096 else DP_U_ALL[0])
+        # 4096 four-query groups in the original tuning
+        self.dense_unit = DP_U if self.has_sparse else (DP_U_ALL[1] if gd * DP_G >= 4096 * 4 else DP_U_ALL[0])
         self.dense_tiles = (self.num_dense_queries + DP_TT - 1) // DP_TT
         self.dense_parts = (gd + self.dense_unit - 1) // self.dense_unit
         rt = KV_PASS if T > KV_PASS_MIN_T else T
@@ -1787,10 +1790,11 @@ def compile_kernels(has_sparse: bool) -> dict:
     missing = [name for name in names if name not in _COMPILED]
     if missing:
         sym_t = cute.sym_int64()
-        f_q = _fake(BF16, (None, HQ, D), sym_t)
-        f_kv = _fake(BF16, (None, HKV, D), sym_t)
+        f_q = make_fake_tensor(BF16, (sym_t, HQ, D), (HQ_ROW * D, D, 1), assumed_align=16)
+        f_kv = make_fake_tensor(BF16, (sym_t, HKV, D), (HKV_ROW * D, D, 1), assumed_align=16)
         f_idx = _fake(I32, (None, W), sym_t, align=4)
-        f_lse = _fake(F32, (None, HQ), sym_t)
+        f_lse = make_fake_tensor(F32, (sym_t, HQ), (HQ_ROW, 1), assumed_align=16)
+        f_delta = _fake(F32, (None, HQ), sym_t)
         f_h = _fake(F32, (None,), cute.sym_int64(divisibility=8))
         f_dense_block_bitmap = _fake(I32, (None,), cute.sym_int64(divisibility=4))
         f_dense_done_count = _fake(I32, (None,), cute.sym_int64(divisibility=4))
@@ -1804,7 +1808,7 @@ def compile_kernels(has_sparse: bool) -> dict:
                 _prep_host,
                 f_q,
                 f_q,
-                f_lse,
+                f_delta,
                 f_h,
                 f_h,
                 f_dense_block_bitmap,
@@ -1823,7 +1827,7 @@ def compile_kernels(has_sparse: bool) -> dict:
                 f_kv,
                 f_q,
                 f_lse,
-                f_lse,
+                f_delta,
                 f_dq_acc,
                 f_h,
                 f_h,
@@ -1841,7 +1845,7 @@ def compile_kernels(has_sparse: bool) -> dict:
                 f_q,
                 f_q,
                 f_lse,
-                f_lse,
+                f_delta,
                 f_dense_block_bitmap,
                 f_dq_acc,
                 f_dense_dkv,
@@ -1862,7 +1866,7 @@ def compile_kernels(has_sparse: bool) -> dict:
                 f_q,
                 f_q,
                 f_lse,
-                f_lse,
+                f_delta,
                 f_dense_block_bitmap,
                 f_dq_acc,
                 f_dense_dkv,

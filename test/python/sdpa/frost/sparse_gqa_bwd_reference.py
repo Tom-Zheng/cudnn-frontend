@@ -1,7 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Gather-based fp32 references for Qwen Sparse Attention (QSA) and its index layout."""
+"""Gather-based fp32 references for Qwen Sparse Attention (QSA) and its index layout.
+
+The head constants are the default geometry (24 Q / 2 KV heads); the references take their head counts from their
+tensors and ``make_inputs`` from ``h_q`` / ``h_kv``, so the same code serves e.g. 64 Q / 4 KV heads.
+"""
 
 import torch
 
@@ -42,6 +46,8 @@ def make_topk_idxs(seq_len, generator):
 
 def reference_forward(q, k, v, topk_idxs):
     """bf16 output and fp32 natural-log LSE of the scaled scores, the backward's saved tensors."""
+    H_Q, H_KV = q.shape[1], k.shape[1]
+    GROUP = H_Q // H_KV
     out = torch.empty_like(q)
     lse = torch.empty((q.shape[0], H_Q), dtype=torch.float32, device=q.device)
     kf, vf = k.float(), v.float()
@@ -65,6 +71,8 @@ def reference_backward(q, k, v, out, dout, lse, topk_idxs):
 
     Not autograd: rows with few keys cancel in dP - Delta, so a Delta from the unrounded O misses the tolerance.
     """
+    H_Q, H_KV = q.shape[1], k.shape[1]
+    GROUP = H_Q // H_KV
     kf, vf = k.float(), v.float()
     dq = torch.empty(q.shape, dtype=torch.float32, device=q.device)
     dk = torch.zeros(k.shape, dtype=torch.float32, device=q.device)
@@ -88,15 +96,15 @@ def reference_backward(q, k, v, out, dout, lse, topk_idxs):
     return dq, dk, dv
 
 
-def make_inputs(seq_len, seed, grad_scale=1.0, device="cuda"):
+def make_inputs(seq_len, seed, grad_scale=1.0, device="cuda", h_q=H_Q, h_kv=H_KV):
     """Random QSA backward operands. ``grad_scale`` shrinks dO to training-like gradient magnitudes."""
     generator = torch.Generator(device=device).manual_seed(seed)
 
     def randn(*shape):
         return torch.randn(shape, device=device, generator=generator, dtype=torch.float32).to(torch.bfloat16)
 
-    q, k, v = randn(seq_len, H_Q, D), randn(seq_len, H_KV, D), randn(seq_len, H_KV, D)
-    dout = (torch.randn((seq_len, H_Q, D), device=device, generator=generator) * grad_scale).to(torch.bfloat16)
+    q, k, v = randn(seq_len, h_q, D), randn(seq_len, h_kv, D), randn(seq_len, h_kv, D)
+    dout = (torch.randn((seq_len, h_q, D), device=device, generator=generator) * grad_scale).to(torch.bfloat16)
     topk_idxs = make_topk_idxs(seq_len, generator)
     out, lse = reference_forward(q, k, v, topk_idxs)
     return {"q": q, "k": k, "v": v, "out": out, "dout": dout, "lse": lse, "topk_idxs": topk_idxs}

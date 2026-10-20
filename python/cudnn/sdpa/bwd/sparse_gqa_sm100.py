@@ -1,10 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Adapter of the SM100 index-list sparse (QSA) d256 backward -- ``kernels/sm100/bprop_sparse_d256_f16.py``."""
+"""Adapter of the SM100 index-list sparse (QSA) d256 backward -- ``kernels/sm100/bprop_sparse_d256_f16.py``.
+
+Served geometries: head dim 256, GQA ratio G in ``GQA_RATIOS`` with an even number of KV heads, and 512 selected
+4-token blocks per query (``topk_idxs`` width 2051). The kernel template covers one pair of KV heads (2 * G query
+heads); a model with more KV heads runs one launch sequence per KV-head pair, each addressing its pair's head slice of
+the caller's tensors in place (no copies, Rule 2) and reusing one workspace.
+"""
 
 from __future__ import annotations
 
+import dataclasses
+import os
 from typing import Optional
 
 import torch
@@ -14,12 +22,42 @@ from cudnn._torch_stream import device_context, stream_context
 from cudnn.api_base import APIBase, TupleDict, WorkspaceCarver
 from cudnn.frost.buffers import cutedsl_requirement_error
 
-NUM_Q_HEADS = 24
+NUM_Q_HEADS = 24  # the default geometry: 24 Q / 2 KV heads, 512 blocks
 NUM_KV_HEADS = 2
 HEAD_DIM = 256
 TOPK_WIDTH = 2051  # 512 blocks x 4 tokens + 3 tail tokens
 SOFTMAX_SCALE = HEAD_DIM**-0.5
+GQA_RATIOS = (12, 16)  # the dense pair kernel tiles its N = 48 score columns as whole queries of G heads
 _SUPPORTED_CAPABILITIES = ((10, 0),)
+_KERNEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", "sm100", "bprop_sparse_d256_f16.py")
+
+
+@dataclasses.dataclass(frozen=True)
+class QsaBwdParams:
+    """Template parameters of ``bprop_sparse_d256_f16.py``: GQA ratio and KV-head pairs of the model."""
+
+    gq: int = 12
+    pairs: int = 1
+
+
+def _kernel_module(params: QsaBwdParams):
+    """The kernel module for ``params``: the plain import for the default geometry, else a template specialization."""
+    if params == QsaBwdParams():
+        from .kernels.sm100 import bprop_sparse_d256_f16 as kernel
+
+        return kernel
+    from cudnn.frost.template_loader import load_template
+
+    return load_template(_KERNEL_FILE, params, tag="qsa_bwd_sm100")
+
+
+def _geometry(num_q_heads: int, num_kv_heads: int) -> Optional[tuple[int, int]]:
+    """(G, KV heads) served for ``num_q_heads``: prefer the declared KV head count, else the first served one."""
+    served = [(g, num_q_heads // g) for g in GQA_RATIOS if num_q_heads % g == 0 and (num_q_heads // g) % 2 == 0]
+    for g, h_kv in served:
+        if h_kv == num_kv_heads:
+            return g, h_kv
+    return served[0] if served else None
 
 
 def _byte_span(tensor: torch.Tensor) -> tuple[int, int]:
@@ -36,12 +74,12 @@ class SparseGqaBwdDslSm100(APIBase):
 
     def __init__(
         self,
-        sample_q: torch.Tensor,  # (T, 24, 256) bf16
-        sample_k: torch.Tensor,  # (T, 2, 256) bf16
-        sample_v: torch.Tensor,  # (T, 2, 256) bf16
-        sample_out: torch.Tensor,  # (T, 24, 256) bf16
-        sample_dout: torch.Tensor,  # (T, 24, 256) bf16
-        sample_lse: torch.Tensor,  # (T, 24) fp32, natural-log LSE of the scaled scores
+        sample_q: torch.Tensor,  # (T, H, 256) bf16, H = G * H_kv (e.g. 24 = 12 * 2 or 64 = 16 * 4)
+        sample_k: torch.Tensor,  # (T, H_kv, 256) bf16, H_kv even
+        sample_v: torch.Tensor,  # (T, H_kv, 256) bf16
+        sample_out: torch.Tensor,  # (T, H, 256) bf16
+        sample_dout: torch.Tensor,  # (T, H, 256) bf16
+        sample_lse: torch.Tensor,  # (T, H) fp32, natural-log LSE of the scaled scores
         sample_topk_idxs: torch.Tensor,  # (T, 2051) int32
         sample_dq: Optional[torch.Tensor] = None,
         sample_dk: Optional[torch.Tensor] = None,
@@ -66,6 +104,7 @@ class SparseGqaBwdDslSm100(APIBase):
         self.softmax_scale = softmax_scale
         self._kernel_module = None
         self._plan = None
+        self._pairs = 1
 
     def check_support(self) -> bool:
         """Validate the DSL version, device, dtypes, shapes and layouts."""
@@ -84,18 +123,25 @@ class SparseGqaBwdDslSm100(APIBase):
             f"{self.__class__.__name__} supports only softmax_scale {SOFTMAX_SCALE}, got {self.softmax_scale}",
         )
         self._value_error_if(q_desc.ndim != 3, f"q must be 3-D (T, {NUM_Q_HEADS}, {HEAD_DIM}), got {q_desc.shape}")
-        seq_len = q_desc.shape[0]
+        seq_len, num_q_heads = q_desc.shape[0], q_desc.shape[1]
+        k_desc = self.descs["k"]
+        geometry = _geometry(num_q_heads, k_desc.shape[1] if k_desc.ndim == 3 else 0)
+        self._value_error_if(
+            geometry is None,
+            f"q must have shape (T, H, {HEAD_DIM}) with H = G * H_kv for G in {GQA_RATIOS} and an even H_kv, got {q_desc.shape}",
+        )
+        gq, num_kv_heads = geometry
         expected = {
-            "q": ((seq_len, NUM_Q_HEADS, HEAD_DIM), torch.bfloat16),
-            "k": ((seq_len, NUM_KV_HEADS, HEAD_DIM), torch.bfloat16),
-            "v": ((seq_len, NUM_KV_HEADS, HEAD_DIM), torch.bfloat16),
-            "out": ((seq_len, NUM_Q_HEADS, HEAD_DIM), torch.bfloat16),
-            "dout": ((seq_len, NUM_Q_HEADS, HEAD_DIM), torch.bfloat16),
-            "lse": ((seq_len, NUM_Q_HEADS), torch.float32),
+            "q": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
+            "k": ((seq_len, num_kv_heads, HEAD_DIM), torch.bfloat16),
+            "v": ((seq_len, num_kv_heads, HEAD_DIM), torch.bfloat16),
+            "out": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
+            "dout": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
+            "lse": ((seq_len, num_q_heads), torch.float32),
             "topk_idxs": ((seq_len, TOPK_WIDTH), torch.int32),
-            "dq": ((seq_len, NUM_Q_HEADS, HEAD_DIM), torch.bfloat16),
-            "dk": ((seq_len, NUM_KV_HEADS, HEAD_DIM), torch.bfloat16),
-            "dv": ((seq_len, NUM_KV_HEADS, HEAD_DIM), torch.bfloat16),
+            "dq": ((seq_len, num_q_heads, HEAD_DIM), torch.bfloat16),
+            "dk": ((seq_len, num_kv_heads, HEAD_DIM), torch.bfloat16),
+            "dv": ((seq_len, num_kv_heads, HEAD_DIM), torch.bfloat16),
         }
         for name, (shape, dtype) in expected.items():
             desc = self.descs[name]
@@ -108,13 +154,14 @@ class SparseGqaBwdDslSm100(APIBase):
                 f"{self.__class__.__name__} addresses only contiguous {name}, got shape {desc.shape} strides {desc.stride}",
             )
 
-        from .kernels.sm100 import bprop_sparse_d256_f16 as kernel
+        kernel = _kernel_module(QsaBwdParams(gq=gq, pairs=num_kv_heads // 2))
 
         self._value_error_if(
             not 1 <= seq_len <= kernel.MAX_SEQ_LEN,
             f"sequence length must be in [1, {kernel.MAX_SEQ_LEN}], got {seq_len}",
         )
         self._kernel_module = kernel
+        self._pairs = num_kv_heads // 2
         self._plan = kernel.LaunchPlan(seq_len, torch.cuda.get_device_properties(q_desc.device).multi_processor_count)
         self._is_supported = True
         return True
@@ -175,7 +222,30 @@ class SparseGqaBwdDslSm100(APIBase):
         scratch = self._plan.carve(WorkspaceCarver(workspace, self.scratch_workspace_bytes(), self.__class__.__name__))
         with device_context(q.device):
             stream = self._get_default_stream(current_stream)
-            self._kernel_module.launch(self._plan, self._compiled_kernel, q, k, v, out, dout, lse, topk_idxs, dq, dk, dv, scratch, stream)
+            if self._pairs == 1:
+                self._kernel_module.launch(self._plan, self._compiled_kernel, q, k, v, out, dout, lse, topk_idxs, dq, dk, dv, scratch, stream)
+            else:
+                # One launch sequence per KV-head pair on views of the caller's tensors; stream order lets every
+                # sequence reuse the same scratch (its prep kernel re-zeroes the accumulators).
+                hq = self._kernel_module.HQ
+                for p in range(self._pairs):
+                    qs, ks = slice(p * hq, (p + 1) * hq), slice(2 * p, 2 * p + 2)
+                    self._kernel_module.launch(
+                        self._plan,
+                        self._compiled_kernel,
+                        q[:, qs],
+                        k[:, ks],
+                        v[:, ks],
+                        out[:, qs],
+                        dout[:, qs],
+                        lse[:, qs],
+                        topk_idxs,
+                        dq[:, qs],
+                        dk[:, ks],
+                        dv[:, ks],
+                        scratch,
+                        stream,
+                    )
         return dq, dk, dv
 
 

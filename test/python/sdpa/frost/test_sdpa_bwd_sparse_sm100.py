@@ -246,3 +246,208 @@ def test_old_dsl_and_other_architecture_rejected():
     with patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)):
         with pytest.raises(NotImplementedError, match="SM100"):
             bwd.SparseGqaBwdDslSm100(*(descs[n] for n in _INPUT_NAMES)).check_support()
+
+
+# Wider GQA geometries: the kernel template runs one launch sequence per KV-head pair (2 * G query heads) on in-place
+# head-slice views of the caller's tensors. 64 Q / 4 KV heads (G = 16) with 512 blocks is the c4 top-512 target; the
+# dense/sparse boundary stays at 12 * 512 * 4 = 24576 queries.
+_GQA_CASES = [
+    # h_q, h_kv, seq_len, grad_scale
+    (64, 4, 2, 1.0),  # tail tokens only
+    (64, 4, 5, 1.0),  # one complete block and a tail
+    (64, 4, 4099, 1.0),  # every query in the dense kernel
+    (64, 4, 24577, 1.0),  # a single query on the query-major kernel
+    (64, 4, 28000, 1.0),  # dense and query-major kernels, two KV passes
+    (64, 4, 28000, 1e-7),  # training-scale gradients
+    (32, 2, 28000, 1.0),  # GQA 16, a single KV-head pair
+    (48, 4, 28000, 1.0),  # GQA 12, two KV-head pairs
+]
+
+
+def _gqa_inputs(h_q, h_kv, seq_len, seed, grad_scale=1.0):
+    return make_inputs(seq_len, seed=seed, grad_scale=grad_scale, h_q=h_q, h_kv=h_kv)
+
+
+def _gqa_kernel(h_q, h_kv):
+    from cudnn.sdpa.bwd import sparse_gqa_sm100
+
+    return sparse_gqa_sm100._kernel_module(sparse_gqa_sm100.QsaBwdParams(gq=h_q // h_kv, pairs=h_kv // 2))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_q, h_kv, seq_len, grad_scale", _GQA_CASES)
+def test_qsa_backward_gqa_geometries_match_reference(h_q, h_kv, seq_len, grad_scale):
+    from cudnn.sdpa import bwd
+
+    inputs = _gqa_inputs(h_q, h_kv, seq_len, seed=seq_len + h_q, grad_scale=grad_scale)
+    grads = bwd.sparse_gqa_bwd_wrapper_sm100(*(inputs[name] for name in _INPUT_NAMES))
+    _check_against_reference(inputs, (grads["dq"], grads["dk"], grads["dv"]))
+
+
+@pytest.mark.L1
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("seq_len", [65536, 262144])  # 262144 * 32 * 256 == 2**31: each pair's dQ accumulator spans the Int32 range
+def test_qsa_backward_h64_kv4_long_sequences(seq_len):
+    from cudnn.sdpa import bwd
+
+    inputs = _gqa_inputs(64, 4, seq_len, seed=seq_len)
+    grads = bwd.sparse_gqa_bwd_wrapper_sm100(*(inputs[name] for name in _INPUT_NAMES))
+    _check_against_reference(inputs, (grads["dq"], grads["dk"], grads["dv"]))
+
+
+@pytest.mark.L0
+def test_qsa_backward_pairs_reuse_a_stale_workspace():
+    """Each pair's prep kernel zeroes the scratch it accumulates into: a NaN-filled workspace leaves no trace."""
+    from cudnn.sdpa import bwd
+
+    inputs = _gqa_inputs(64, 4, 28000, seed=11)
+    args = [inputs[name] for name in _INPUT_NAMES]
+    plan = bwd.SparseGqaBwdDslSm100(*args)
+    plan.compile()
+    workspace = torch.full((plan.scratch_workspace_bytes() // 4,), float("nan"), device="cuda").view(torch.uint8)
+    outputs = [torch.full_like(inputs[name], float("nan")) for name in ("q", "k", "v")]
+    plan.execute(*args, *outputs, workspace=workspace)
+    _check_against_reference(inputs, outputs)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("seq_len", [4099, 28000])  # the dense-only and the dense + sparse launch sequences
+def test_gqa_execute_allocates_nothing_and_never_synchronizes(seq_len, monkeypatch, compile_allocates_nothing):
+    from cudnn.sdpa import bwd
+
+    monkeypatch.setattr(_gqa_kernel(64, 4), "_COMPILED", {})
+    inputs = _gqa_inputs(64, 4, seq_len, seed=5)
+    args = [inputs[name] for name in _INPUT_NAMES]
+    plan = bwd.SparseGqaBwdDslSm100(*args)
+    assert plan.check_support()
+    compile_allocates_nothing(plan)
+    outputs = [torch.empty_like(inputs[name]) for name in ("q", "k", "v")]
+    workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+    plan.execute(*args, *outputs, workspace=workspace)
+    torch.cuda.synchronize()
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3):
+            plan.execute(*args, *outputs, workspace=workspace)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+    _check_against_reference(inputs, outputs)
+
+
+@pytest.mark.L0
+def test_gqa_launches_one_sequence_per_kv_head_pair_on_the_explicit_stream(monkeypatch):
+    from cudnn.sdpa import bwd
+
+    kernel = _gqa_kernel(64, 4)
+    streams = []
+    launch = kernel.launch
+
+    def record(fn):
+        def call(*fn_args):
+            streams.append(int(fn_args[-1]))
+            return fn(*fn_args)
+
+        return call
+
+    monkeypatch.setattr(kernel, "launch", lambda plan, fns, *rest: launch(plan, {name: record(fn) for name, fn in fns.items()}, *rest))
+    inputs = _gqa_inputs(64, 4, 28000, seed=3)
+    args = [inputs[name] for name in _INPUT_NAMES]
+    dq, dk, dv = (torch.empty_like(inputs[name]) for name in ("q", "k", "v"))
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    grads = bwd.sparse_gqa_bwd_wrapper_sm100(*args, dq=dq, dk=dk, dv=dv, stream=cuda.CUstream(side.cuda_stream))
+    torch.cuda.current_stream().wait_stream(side)
+    assert streams == [side.cuda_stream] * 12  # two pairs x (prep, part, bitmap, sparse, dense, finalize)
+    assert grads["dq"] is dq and grads["dk"] is dk and grads["dv"] is dv
+    _check_against_reference(inputs, (dq, dk, dv))
+
+
+@pytest.mark.L0
+def test_gqa_first_execute_under_cuda_graph_capture_replays_new_inputs(monkeypatch):
+    from cudnn.sdpa import bwd
+
+    monkeypatch.setattr(_gqa_kernel(64, 4), "_COMPILED", {})
+    first, second = (_gqa_inputs(64, 4, 28000, seed=s) for s in (21, 22))
+    static = {name: first[name].clone() for name in _INPUT_NAMES}
+    args = [static[name] for name in _INPUT_NAMES]
+    plan = bwd.SparseGqaBwdDslSm100(*args)
+    plan.compile()
+    grads = [torch.empty_like(first[name]) for name in ("q", "k", "v")]
+    workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.execute(*args, *grads, workspace=workspace)
+    for inputs in (first, second):
+        for name in _INPUT_NAMES:
+            static[name].copy_(inputs[name])
+        graph.replay()
+        _check_against_reference(inputs, grads)
+
+
+def _gqa_descs(h_q, h_kv, width=2051, seq_len=64):
+    q = torch.empty((seq_len, h_q, 256), dtype=torch.bfloat16, device="cuda")
+    kv = torch.empty((seq_len, h_kv, 256), dtype=torch.bfloat16, device="cuda")
+    lse = torch.empty((seq_len, h_q), dtype=torch.float32, device="cuda")
+    idx = torch.empty((seq_len, width), dtype=torch.int32, device="cuda")
+    return {name: _metadata(t) for name, t in zip(_INPUT_NAMES, (q, kv, kv, q, q, lse, idx))}
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("h_q, h_kv", [(24, 2), (64, 4), (32, 2), (48, 4), (96, 8)])
+def test_check_support_accepts_gqa_geometries(h_q, h_kv):
+    from cudnn.sdpa import bwd
+    from cudnn.sdpa.bwd import sparse_gqa_sm100
+
+    descs = _gqa_descs(h_q, h_kv)
+    plan = bwd.SparseGqaBwdDslSm100(*(descs[n] for n in _INPUT_NAMES))
+    assert plan.check_support()
+    assert (plan._kernel_module.GQ, plan._kernel_module.PAIRS, plan._kernel_module.W) == (h_q // h_kv, h_kv // 2, 2051)
+    # The default geometry stays the plain module import; every other one is a template specialization.
+    assert (plan._kernel_module is _gqa_kernel(24, 2)) == ((h_q, h_kv) == (24, 2))
+    assert sparse_gqa_sm100._kernel_module(sparse_gqa_sm100.QsaBwdParams()) is _gqa_kernel(24, 2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "h_q, h_kv, width, match",
+    [
+        (16, 1, 2051, "q must have shape"),  # G = 16 with a single KV head: no KV-head pair
+        (16, 2, 2051, "q must have shape"),  # G = 8
+        (48, 3, 2051, "k must have shape"),  # 48 heads are served as 12 x 4, not 16 x 3
+        (64, 4, 515, "topk_idxs must have shape"),  # 128 blocks
+    ],
+)
+def test_check_support_declines_other_gqa_geometries(h_q, h_kv, width, match):
+    from cudnn.sdpa import bwd
+
+    descs = _gqa_descs(h_q, h_kv, width)
+    with pytest.raises(ValueError, match=match):
+        bwd.SparseGqaBwdDslSm100(*(descs[n] for n in _INPUT_NAMES)).check_support()
+
+
+@pytest.mark.L0
+def test_check_support_bounds_the_gqa16_sequence_length():
+    from cudnn.sdpa import bwd
+
+    for seq_len, ok in ((2**31 // (32 * 256), True), (2**31 // (32 * 256) + 1, False)):
+        descs = {}
+        for name, (shape, dtype) in {
+            "q": ((seq_len, 64, 256), torch.bfloat16),
+            "k": ((seq_len, 4, 256), torch.bfloat16),
+            "v": ((seq_len, 4, 256), torch.bfloat16),
+            "out": ((seq_len, 64, 256), torch.bfloat16),
+            "dout": ((seq_len, 64, 256), torch.bfloat16),
+            "lse": ((seq_len, 64), torch.float32),
+            "topk_idxs": ((seq_len, 2051), torch.int32),
+        }.items():
+            stride = tuple(int(torch.tensor(shape[i + 1 :]).prod()) for i in range(len(shape)))
+            descs[name] = TensorDesc(dtype, shape, stride, tuple(reversed(range(len(shape)))), torch.device("cuda", torch.cuda.current_device()))
+        plan = bwd.SparseGqaBwdDslSm100(*(descs[n] for n in _INPUT_NAMES))
+        if ok:
+            assert plan.check_support()
+        else:
+            with pytest.raises(ValueError, match="sequence length"):
+                plan.check_support()
